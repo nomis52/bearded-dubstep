@@ -1,7 +1,31 @@
-Two implementations are included, one that uses the serial port, and the other
-that uses libusb directly.
+Two implementations are included, one that uses the OS serial port driver,
+the other uses libusb directly.
 
-== Serial Port (serial.cpp) ==
+# Serial Port (serial.cpp)
 
+This uses the host's CDC driver, and accesses the device as if it were any other seiral port.
 
-== Libusb (libusb.cpp) ==
+Advantages:
+* Cross platform, pretty much every OS should have a CDC driver
+
+Disadvantages:
+* Can't access the USB serial number
+* Can't reset the device.
+* Have to scan all serial ports looking for possible widgets.
+
+# Libusb (libusb.cpp)
+
+This looks for the device 
+
+Some platforms (Mac) won't allow libusb to detatch the kernel driver, so I had to change the USB class
+code so that the USB device wouldn't show up as a CDC device. 
+
+On Linux, we'd have to set a udev rule to prevent the ACM driver from claiming the device.
+
+Advantages:
+* Can reset the device using libusb
+* Can access the device's serial number
+* We know exactly what device to look for.
+
+Disadvantages:
+* Have to change the USB Device code if you want to 
