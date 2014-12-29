@@ -1,0 +1,7 @@
+Two implementations are included, one that uses the serial port, and the other
+that uses libusb directly.
+
+== Serial Port (serial.cpp) ==
+
+
+== Libusb (libusb.cpp) ==
