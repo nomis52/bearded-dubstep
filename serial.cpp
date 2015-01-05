@@ -30,6 +30,7 @@
 using std::cerr;
 using std::cout;
 using std::endl;
+using std::string;
 
 // Use /dev/ttyACN0 on Linux
 // Use "\\\\.\\USBSER000" or "\\\\.\\COM6" on Windows.
@@ -54,13 +55,23 @@ int main() {
 
   while (true) {
     // TODO(simon): write the entire message here.
-    char c = 'a';
-    int r = write(fd, &c, sizeof(c));
+    const string request(
+        "this is the request 1234567890 abcdefghijklmnopqrstuvwxyz");
+    int r = write(fd, request.c_str(), request.size());
     if (r == -1) {
       cerr << "write() failed: " << strerror(errno) << endl;
       return -1;
     }
-    cout << c << endl;
+
+    char buffer[128];
+    r = read(fd, buffer, sizeof(buffer));
+    if (r < 0) {
+      cerr << "Read failed: " << strerror(errno) << endl;
+      break;
+    }
+    cout << "Got " << r << " bytes " << endl;
+    const string response(buffer, r);
+    cout << response << endl;
     sleep(1);
   }
   close(fd);

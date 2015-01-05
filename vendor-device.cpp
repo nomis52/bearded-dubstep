@@ -20,9 +20,10 @@
 
 #include <errno.h>
 #include <libusb.h>
-#include <stdint.h>
-#include <unistd.h>
 #include <pthread.h>
+#include <stdint.h>
+#include <sys/time.h>
+#include <unistd.h>
 #include <iostream>
 #include <iomanip>
 #include <queue>
@@ -30,6 +31,8 @@
 
 using std::cerr;
 using std::cout;
+using std::setw;
+using std::ostream;
 using std::endl;
 using std::string;
 
@@ -39,13 +42,26 @@ static const uint8_t kInEndpoint  = 0x81;
 static const uint8_t kOutEndpoint = 0x01;
 static const unsigned int kTimeout = 1000;
 
+template <typename T, size_t N>
+  char (&ArraySizeHelper(T (&array)[N]))[N];
+
+template <typename T, size_t N>
+  char (&ArraySizeHelper(const T (&array)[N]))[N];
+
+ostream& operator<<(std::ostream &out, const struct timeval &tv) {
+  return out << std::dec << tv.tv_sec << "." << std::setw(6)
+             << std::setfill('0') << tv.tv_usec;
+}
+
+#define arraysize(array) (sizeof(ArraySizeHelper(array)))
+
 class LibUsbThread;
 
 void *StartThread(void *d);
 
 class LibUsbThread {
  public:
-  LibUsbThread(libusb_context *context)
+  explicit LibUsbThread(libusb_context *context)
       : m_context(context),
         m_thread_id(),
         m_terminate(false),
@@ -115,12 +131,11 @@ void OutTransferCompleteHandler(struct libusb_transfer *transfer);
 
 class UsbSender {
  public:
-  UsbSender(libusb_device_handle *device)
+  explicit UsbSender(libusb_device_handle *device)
       : m_device(device),
         m_in_transfer(NULL),
         m_out_transfer(NULL),
         m_got_response(false) {
-
     pthread_mutex_init(&m_mutex, NULL);
     pthread_cond_init(&m_condition, NULL);
 
@@ -133,23 +148,52 @@ class UsbSender {
     pthread_cond_destroy(&m_condition);
   }
 
-  void SendRequest(const string &message) {
-    size_t data_size = std::min(
-        message.size(), static_cast<size_t>(OUT_BUFFER_SIZE));
-    memcpy(m_out_buffer, message.c_str(), data_size);
+  bool SendRequest(uint16_t command, const uint8_t *data, unsigned int size) {
+    if (size > MAX_MESSAGE_SIZE) {
+      cerr << "Message exceeds max size" << endl;
+      return false;
+    }
+
+    unsigned int offset = 0;
+    m_out_buffer[0] = SOF_IDENTIFIER;
+    m_out_buffer[1] = static_cast<uint8_t>(command & 0xff);
+    m_out_buffer[2] = static_cast<uint8_t>(command >> 8);
+    m_out_buffer[3] = static_cast<uint8_t>(size & 0xff);
+    m_out_buffer[4] = static_cast<uint8_t>(size >> 8);
+    offset += 5;
+
+    if (size > 0) {
+      memcpy(m_out_buffer + offset, data, size);
+      offset += size;
+    }
+    m_out_buffer[offset++] = EOF_IDENTIFIER;
+
+    if (offset % MAX_PACKET_SIZE == 0)  {
+      // We need to pad the messaeg so that the transfer completes at the PIC
+      // end. We could use LIBUSB_TRANSFER_ADD_ZERO_PACKET instead.
+      m_out_buffer[offset++] = 0;
+    }
+
     libusb_fill_bulk_transfer(m_out_transfer, m_device, kOutEndpoint,
-                              m_out_buffer, data_size,
+                              m_out_buffer, offset,
                               OutTransferCompleteHandler,
                               static_cast<void*>(this),
                               kTimeout);
+    gettimeofday(&m_send_out_time, NULL);
+    cout << "Sending " << std::dec << offset << " bytes at "
+         << m_send_out_time << endl;
+
     int r = libusb_submit_transfer(m_out_transfer);
     if (r) {
       cerr << "Failed to submit out transfer" << endl;
     }
+    return r == 0;
   }
 
   void _OutTransferComplete() {
-    cout << "Out transfer completed, status is "
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    cout << "Out transfer completed at " << tv << ", status is "
          << libusb_error_name(m_out_transfer->status) << endl;
     if (m_out_transfer->status == LIBUSB_TRANSFER_COMPLETED) {
       cout << "Sent " << m_out_transfer->actual_length << " bytes" << endl;
@@ -158,17 +202,23 @@ class UsbSender {
   }
 
   void _InTransferComplete() {
-    cout << "In transfer completed, status is "
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    cout << "In transfer completed, at " << tv << ", status is "
          << libusb_error_name(m_in_transfer->status) << endl;
     if (m_in_transfer->status == LIBUSB_TRANSFER_COMPLETED) {
-      cout << "Got " << m_in_transfer->actual_length << " bytes" << endl;
+      cout << "Got " << std::dec << m_in_transfer->actual_length << " bytes"
+           << endl;
       cout << "Received: " << std::hex;
       for (unsigned int i = 0; i < m_in_transfer->actual_length; i++) {
         cout << std::setw(2) << std::setfill('0')
-             << (int) m_in_transfer->buffer[i] << " ";
+             << static_cast<int>(m_in_transfer->buffer[i]) << " ";
       }
       cout << endl;
     }
+    struct timeval diff;
+    timersub(&tv, &m_send_out_time, &diff);
+    cout << "Total time was " << diff << endl;
     pthread_mutex_lock(&m_mutex);
     m_got_response = true;
     pthread_mutex_unlock(&m_mutex);
@@ -186,14 +236,19 @@ class UsbSender {
     }
   }
 
- private:
-  // Should be a multiple of the endpoint packet size (64?)
   enum {
-    IN_BUFFER_SIZE = 512
+    ECHO_COMMAND = 0x80,
+    TX_DMX = 0x81
+  };
+
+ private:
+  // Should be a multiple of the endpoint packet size to avoid libusb overflows.
+  enum {
+    IN_BUFFER_SIZE = 1024
   };
 
   enum {
-    OUT_BUFFER_SIZE = 512
+    OUT_BUFFER_SIZE = 1024
   };
 
   uint8_t m_in_buffer[IN_BUFFER_SIZE];
@@ -206,6 +261,8 @@ class UsbSender {
   pthread_mutex_t m_mutex;
   pthread_cond_t m_condition;
   bool m_got_response;
+  struct timeval m_send_out_time;
+  struct timeval m_send_in_time;
 
   void SubmitInTransfer() {
     libusb_fill_bulk_transfer(m_in_transfer, m_device, kInEndpoint,
@@ -213,12 +270,18 @@ class UsbSender {
                                    InTransferCompleteHandler,
                                    static_cast<void*>(this),
                                    kTimeout);
+    gettimeofday(&m_send_in_time, NULL);
     int r = libusb_submit_transfer(m_in_transfer);
     if (r) {
       cerr << "Failed to submit input transfer" << endl;
     }
-    cout << "Submitted in transfer" << endl;
+    cout << "Submitted in transfer at " << m_send_in_time << endl;
   }
+
+  static const uint8_t SOF_IDENTIFIER = 0x5a;
+  static const uint8_t EOF_IDENTIFIER = 0xa5;
+  static const unsigned int MAX_MESSAGE_SIZE = 513;
+  static const unsigned int MAX_PACKET_SIZE = 64;
 };
 
 void InTransferCompleteHandler(struct libusb_transfer *transfer) {
@@ -306,10 +369,18 @@ int main(int argc, char **argv) {
   }
 
   UsbSender sender(device);
-  // char request[] = {0x80};
-  char request[] = {0x82, 1, 2, 3, 4};
-  sender.SendRequest(request);
-  sender.Wait();
+
+  while (1) {
+    uint8_t request[] = {1, 2, 3};
+
+    if (!sender.SendRequest(UsbSender::TX_DMX, request,
+                            arraysize(request))) {
+      break;
+    }
+    sender.Wait();
+    sleep(1);
+    break;
+  }
 
   r = libusb_release_interface(device, 0);
   thread.CloseDevice(device);
